@@ -61,12 +61,18 @@ interface FullenrichCompany {
 
 let credits = 0;
 async function search(name: string): Promise<Candidate[]> {
-  const res = await fetch("https://app.fullenrich.com/api/v2/company/search", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${config.fullenrichApiKey}`, "content-type": "application/json" },
-    body: JSON.stringify({ names: [{ value: name, exact_match: true }], limit: 3 }),
-    signal: AbortSignal.timeout(20000),
-  });
+  let res: Response;
+  // limite de requêtes par minute (429) : on attend la minute demandée, cinq fois au plus
+  for (let attempt = 0; ; attempt++) {
+    res = await fetch("https://app.fullenrich.com/api/v2/company/search", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${config.fullenrichApiKey}`, "content-type": "application/json" },
+      body: JSON.stringify({ names: [{ value: name, exact_match: true }], limit: 3 }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (res.status !== 429 || attempt >= 5) break;
+    await new Promise((r) => setTimeout(r, 61000));
+  }
   if (!res.ok) throw new Error(`FullEnrich ${res.status}: ${(await res.text()).slice(0, 120)}`);
   const data = (await res.json()) as { companies?: FullenrichCompany[]; metadata?: { credits?: number } };
   credits += data.metadata?.credits ?? 0;
