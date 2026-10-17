@@ -23,6 +23,11 @@
  * chez un employeur direct de plus de 50 personnes).
  * `--tri-seul` : refait le choix du contact à partir des résultats déjà en base, sans nouvelle recherche, pour
  * les entreprises dont la dernière recherche n'a pas été triée (session interrompue).
+ * `--fullenrich` : pour les entreprises restées sans contact fiable (aucun, ou de confiance faible) et qui ont une
+ * offre tech à citer, cherche les personnes dans la base de FullEnrich (API Search, 0,25 crédit par personne renvoyée)
+ * au lieu du web : salariés ACTUELS de l'entreprise (par son domaine connu, sinon son nom exact) aux postes visés.
+ * Même choix par sessions Claude Code ; un contact n'y est remplacé que par un meilleur. Une recherche par entreprise
+ * (table `people_search`).
  * `--natures=produit,autre` : natures d'entreprise visées (`produit` par défaut, voir classify-companies.ts).
  * `--effectif-max=199` : effectif maximal (1000 par défaut).
  * `--effectif-min=1` : effectif minimal (5 par défaut).
@@ -32,8 +37,10 @@ import { spawn } from "node:child_process";
 import os from "node:os";
 import { config } from "../src/config.js";
 import { db } from "../src/db.js";
+import { CITABLE } from "../src/pitch.js";
 
 db.exec(`
+CREATE TABLE IF NOT EXISTS people_search (company_key TEXT PRIMARY KEY, results TEXT NOT NULL, fetched_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS contact_search (
   company_key TEXT PRIMARY KEY, results TEXT NOT NULL, fetched_at INTEGER NOT NULL,
   tries INTEGER NOT NULL DEFAULT 1,      -- recherches déjà faites (une par formulation, 3 au plus)
@@ -55,7 +62,8 @@ for (const [column, initial] of [["tries", 1], ["hiring", 0]] as const) {
 const args = process.argv.slice(2);
 const retry = args.includes("--relance");
 const sortOnly = args.includes("--tri-seul");
-const keepBetter = retry || sortOnly; // un contact existant n'est remplacé que par un meilleur
+const viaFullenrich = args.includes("--fullenrich");
+const keepBetter = retry || sortOnly || viaFullenrich; // un contact existant n'est remplacé que par un meilleur
 const limit = Number(args.find((a) => /^\d+$/.test(a))) || 1000;
 const option = (name: string): string | undefined => args.find((a) => a.startsWith(`--${name}=`))?.split("=")[1];
 const types = (option("natures") ?? "produit").split(",").filter(Boolean);
@@ -67,8 +75,14 @@ const TARGETS = `(SELECT company_key, company, COALESCE(posted_at, first_seen_at
 // Employeur direct de plus de 50 personnes : le CTO y est trop haut placé pour répondre. On y cherche celui qui dirige
 // le recrutement (contact principal) et le manager qui recrute pour son équipe technique (second contact).
 const HIRING = "s.headcount > 50 AND t.type NOT IN ('cabinet_recrutement', 'conseil_esn_agence')";
-const pending = sortOnly
-  ? "j.company_key IN (SELECT k.company_key FROM contacts k JOIN contact_search cs USING (company_key) WHERE k.confidence IN ('aucune', 'faible') AND cs.fetched_at > k.found_at)"
+const pending = viaFullenrich
+  ? // sans contact fiable, jamais cherchée dans FullEnrich, avec une offre tech à citer, et aucun signalement
+    `(j.company_key NOT IN (SELECT company_key FROM contacts WHERE confidence IN ('haute', 'moyenne'))
+      AND j.company_key NOT IN (SELECT company_key FROM people_search)
+      AND j.company_key NOT IN (SELECT company_key FROM company_flags)
+      AND EXISTS (SELECT 1 FROM jobs x WHERE x.company_key = j.company_key AND ${CITABLE("x.")}))`
+  : sortOnly
+  ?"j.company_key IN (SELECT k.company_key FROM contacts k JOIN contact_search cs USING (company_key) WHERE k.confidence IN ('aucune', 'faible') AND cs.fetched_at > k.found_at)"
   : retry
   ? "j.company_key IN (SELECT k.company_key FROM contacts k JOIN contact_search cs USING (company_key) WHERE k.confidence IN ('aucune', 'faible') AND cs.tries < 3)"
   : // sans contact ; ou dont le contact date d'avant la recherche du recrutement, sauf s'il a été saisi à la main
@@ -90,7 +104,7 @@ const companies = db
      LIMIT ?`
   )
   .all(...types, minSize, maxSize, limit) as Array<{ id: string; nom: string; effectif: number | null; nature: string; offres: number; tries: number; recrutement: number }>;
-console.log(`${companies.length} entreprise(s) ${sortOnly ? "à trier de nouveau" : retry ? "à relancer" : "sans contact, ou à recibler sur le recrutement"}`);
+console.log(`${companies.length} entreprise(s) ${viaFullenrich ? "sans contact fiable, à chercher dans FullEnrich" : sortOnly ? "à trier de nouveau" : retry ? "à relancer" : "sans contact, ou à recibler sur le recrutement"}`);
 type Company = (typeof companies)[number];
 
 // Le recrutement est cherché aux deux premières recherches ; à la troisième, l'entreprise restée sans contact se
@@ -127,7 +141,64 @@ async function serper(q: string): Promise<Result[]> {
     .filter((r) => /linkedin\.com\/in\//.test(r.link))
     .map((r) => ({ title: r.title ?? "", snippet: r.snippet ?? "", url: r.link.split("?")[0] }));
 }
+// Recherche dans FullEnrich : mêmes familles de postes, en intitulés (rapprochés avec tolérance par l'API)
+const FE_TECH = ["CTO", "Chief Technology Officer", "VP Engineering", "Head of Engineering", "Directeur technique", "Co-founder", "Founder", "CEO", "Fondateur", "Président"];
+const FE_TALENT = ["Talent Acquisition", "Head of Talent", "Tech Recruiter", "Technical Recruiter", "Responsable recrutement", "Chargé de recrutement", "Head of People", "DRH", "Directeur des ressources humaines"];
+const FE_MANAGER = ["VP Engineering", "Head of Engineering", "Director of Engineering", "Engineering Manager", "Responsable technique", "Responsable des développements"];
+const knownDomain = db.prepare(
+  `SELECT COALESCE((SELECT domain FROM company_profiles WHERE company_key = ? AND domain IS NOT NULL),
+                   (SELECT slug FROM jobs WHERE company_key = ? AND ats = 'site' LIMIT 1)) AS domain`
+).pluck();
+const peopleCache = db.prepare("INSERT OR REPLACE INTO people_search (company_key, results, fetched_at) VALUES (?, ?, ?)");
+let feCredits = 0;
+interface FePerson {
+  full_name?: string; headline?: string; location?: { city?: string; country?: string };
+  social_profiles?: { professional_network?: { url?: string } };
+  employment?: { current?: { title?: string; start_at?: string; company?: { name?: string; domain?: string } } };
+}
+async function fullenrichPeople(c: Company, titles: string[]): Promise<Result[]> {
+  const domain = knownDomain.get(c.id, c.id) as string | null;
+  const company = domain
+    ? { current_company_domains: [{ value: domain.replace(/^www\./, ""), exact_match: true }] }
+    : // par le nom seul, les homonymes étrangers sont légion (« GIC » : un fonds de Singapour) : salariés en France seulement
+      { current_company_names: [{ value: c.nom, exact_match: true }], person_locations: [{ value: "France" }] };
+  let res: Response;
+  // limite de requêtes par minute (429) : on attend la minute demandée, cinq fois au plus
+  for (let attempt = 0; ; attempt++) {
+    res = await fetch("https://app.fullenrich.com/api/v2/people/search", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${config.fullenrichApiKey}`, "content-type": "application/json" },
+      body: JSON.stringify({ ...company, current_position_titles: titles.map((value) => ({ value })), limit: 10 }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (res.status !== 429 || attempt >= 5) break;
+    await new Promise((r) => setTimeout(r, 61000));
+  }
+  if (!res.ok) throw new Error(`FullEnrich ${res.status}: ${(await res.text()).slice(0, 120)}`);
+  const data = (await res.json()) as { people?: FePerson[]; metadata?: { credits?: number } };
+  feCredits += data.metadata?.credits ?? 0;
+  return (data.people ?? [])
+    .filter((p) => /linkedin\.com\/in\//.test(p.social_profiles?.professional_network?.url ?? ""))
+    .map((p) => {
+      const job = p.employment?.current;
+      return {
+        title: [p.full_name, job?.title, job?.company?.name].filter(Boolean).join(" - "),
+        snippet: [p.headline, [p.location?.city, p.location?.country].filter(Boolean).join(", "),
+          job?.start_at ? `en poste depuis ${job.start_at.slice(0, 7)}` : ""].filter(Boolean).join(" · "),
+        url: p.social_profiles!.professional_network!.url!,
+      };
+    });
+}
+
 async function search(c: Company): Promise<Result[]> {
+  if (viaFullenrich) {
+    const results: Result[] = [];
+    for (const titles of hiring(c) ? [FE_TALENT, FE_MANAGER] : [FE_TECH]) {
+      for (const r of await fullenrichPeople(c, titles)) if (!results.some((k) => k.url === r.url)) results.push(r);
+    }
+    peopleCache.run(c.id, JSON.stringify(results), Date.now());
+    return results;
+  }
   const hit = cached.get(c.id) as { results: string; hiring: number } | undefined;
   const results = hit ? (JSON.parse(hit.results) as Result[]) : [];
   // déjà cherchée, sauf si le recrutement doit l'être et ne l'a pas encore été
@@ -247,7 +318,7 @@ await Promise.all(
     }
   })
 );
-console.log(`${found.size} recherche(s), dont ${paid} payée(s)`);
+console.log(`${found.size} recherche(s), dont ${paid} payée(s)` + (viaFullenrich ? ` · ${feCredits} crédit(s) FullEnrich` : ""));
 
 // 2. choix du contact par sessions Claude Code
 const putInto = (table: "contacts" | "second_contacts") =>
