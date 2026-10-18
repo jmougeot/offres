@@ -27,6 +27,10 @@ La base SQLite reste dans `data/` et n'est pas versionnée.
 - [sequence-mail](https://github.com/jmougeot/sequence-mail) : séquences d'emails et LinkedIn
 - [enrichissement](https://github.com/jmougeot/enrichissement) : prospection B2B
 
+## Contribuer
+
+Voir [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Licence
 
 MIT
